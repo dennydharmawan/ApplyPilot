@@ -6,6 +6,13 @@ resume.pdf
 .env.*
 !.env.example
 
+# Per-Profile data in this checkout (resumes, chrome, sqlite) — never commit
+/profiles/
+
+# Local agent scratch (wayfinder map, ultracode runs) — never commit
+.scratch/
+.workflow/
+
 # Runtime artifacts
 *.db
 tailored_resumes/
