@@ -35,7 +35,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Job discovery (HiringCafe)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -59,44 +59,19 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+def _run_discover(query, workers: int = 1) -> dict:
+    from applypilot.discovery.hiringcafe import run_discovery
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
-
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
-
-    # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
-
-    return stats
+    console.print("  [cyan]HiringCafe discover...[/cyan]")
+    result = run_discovery(query)
+    return {
+        "status": "ok",
+        "pages": result.pages,
+        "fetched": result.fetched,
+        "inserted": result.inserted,
+        "duplicates": result.duplicates,
+        "skipped": result.skipped,
+    }
 
 
 def _run_enrich(workers: int = 1) -> dict:
@@ -262,6 +237,7 @@ def _run_stage_streaming(
     min_score: int = 7,
     workers: int = 1,
     validation_mode: str = "normal",
+    query=None,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -276,11 +252,13 @@ def _run_stage_streaming(
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
+    if stage == "discover":
+        kwargs["query"] = query
 
     upstream = _UPSTREAM[stage]
 
     if stage == "discover":
-        # Discover runs once (its sub-scrapers already do their full crawl)
+        # Discover is a single crawl, then the stage is done.
         try:
             result = runner(**kwargs)
             tracker.mark_done(stage, result)
@@ -324,7 +302,7 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    validation_mode: str = "normal", query=None) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -347,19 +325,14 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
+            if name == "discover":
+                kwargs["query"] = query
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
             status = "ok"
             if isinstance(result, dict):
                 status = result.get("status", "ok")
-                if name == "discover":
-                    sub_errors = [
-                        f"{k}: {v}" for k, v in result.items()
-                        if isinstance(v, str) and v.startswith("error")
-                    ]
-                    if sub_errors:
-                        status = "partial"
 
         except Exception as e:
             elapsed = time.time() - t0
@@ -378,7 +351,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   validation_mode: str = "normal", query=None) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -400,7 +373,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, workers, validation_mode, query),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -448,6 +421,7 @@ def run_pipeline(
     stream: bool = False,
     workers: int = 1,
     validation_mode: str = "normal",
+    query=None,
 ) -> dict:
     """Run pipeline stages.
 
@@ -471,6 +445,10 @@ def run_pipeline(
         stages = ["all"]
     ordered = _resolve_stages(stages)
 
+    if "discover" in ordered and query is None:
+        from applypilot.discovery.hiringcafe import EmptyQueryError
+        raise EmptyQueryError("Discover requires --query with non-empty keywords")
+
     # Banner
     mode = "streaming" if stream else "sequential"
     console.print()
@@ -489,6 +467,8 @@ def run_pipeline(
 
     if dry_run:
         console.print(f"\n  [yellow]DRY RUN[/yellow] — would execute ({mode}):")
+        if "discover" in ordered and query is not None:
+            console.print(f"    discover query: {query.text}")
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")
@@ -498,10 +478,10 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
+                                validation_mode=validation_mode, query=query)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+                                 validation_mode=validation_mode, query=query)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

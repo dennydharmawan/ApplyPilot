@@ -83,6 +83,11 @@ def run(
             "Defaults to 'all' if omitted."
         ),
     ),
+    query: Optional[str] = typer.Option(
+        None,
+        "--query",
+        help="Search keywords for HiringCafe discover (required when discover runs).",
+    ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
@@ -101,7 +106,8 @@ def run(
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
 
-    from applypilot.pipeline import run_pipeline
+    from applypilot.discovery.hiringcafe import EmptyQueryError, parse_run_query
+    from applypilot.pipeline import run_pipeline, _resolve_stages
 
     stage_list = stages if stages else ["all"]
 
@@ -113,6 +119,13 @@ def run(
                 f"Valid stages: {', '.join(VALID_STAGES)}, all"
             )
             raise typer.Exit(code=1)
+
+    ordered = _resolve_stages(stage_list)
+    try:
+        discover_query = parse_run_query(query, ordered)
+    except EmptyQueryError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
 
     # Gate AI stages behind Tier 2
     llm_stages = {"score", "tailor", "cover"}
@@ -136,6 +149,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        query=discover_query,
     )
 
     if result.get("errors"):
