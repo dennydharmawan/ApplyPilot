@@ -1,5 +1,3 @@
-"""HiringCafe SSR job discovery."""
-
 from __future__ import annotations
 
 import json
@@ -55,11 +53,15 @@ _NEXT_DATA_RE = re.compile(
 
 
 class EmptyQueryError(ValueError):
-    """Discover ran without a non-empty --query."""
+    pass
 
 
-class DiscoverError(RuntimeError):
-    """SSR fetch or parse failed."""
+class SsrFetchError(RuntimeError):
+    pass
+
+
+class SsrParseError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,16 +237,16 @@ def _hit_to_job(hit: dict[str, Any]) -> dict[str, Any] | None:
 def _parse_ssr_html(html: str) -> _ParsedPage:
     match = _NEXT_DATA_RE.search(html)
     if not match:
-        raise DiscoverError("SSR response missing __NEXT_DATA__")
+        raise SsrParseError("SSR response missing __NEXT_DATA__")
 
     try:
         data = json.loads(match.group(1))
     except json.JSONDecodeError as exc:
-        raise DiscoverError("SSR __NEXT_DATA__ is not valid JSON") from exc
+        raise SsrParseError("SSR __NEXT_DATA__ is not valid JSON") from exc
 
     page_props = data.get("props", {}).get("pageProps")
     if not isinstance(page_props, dict):
-        raise DiscoverError("SSR response missing pageProps")
+        raise SsrParseError("SSR response missing pageProps")
 
     raw_hits = page_props.get("ssrHits") or []
     is_last_page = bool(page_props.get("ssrIsLastPage"))
@@ -263,9 +265,9 @@ def _fetch_ssr(client: httpx.Client, search: _Search, page: int) -> str:
     try:
         response = client.get(url)
     except httpx.HTTPError as exc:
-        raise DiscoverError(f"SSR fetch failed for page {page}") from exc
+        raise SsrFetchError(f"SSR fetch failed for page {page}") from exc
     if response.status_code != 200:
-        raise DiscoverError(
+        raise SsrFetchError(
             f"SSR fetch returned {response.status_code} for page {page}"
         )
     return response.text

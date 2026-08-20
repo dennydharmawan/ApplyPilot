@@ -258,7 +258,6 @@ def _run_stage_streaming(
     upstream = _UPSTREAM[stage]
 
     if stage == "discover":
-        # Discover is a single crawl, then the stage is done.
         try:
             result = runner(**kwargs)
             tracker.mark_done(stage, result)
