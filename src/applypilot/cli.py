@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -49,6 +50,11 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _print_job_lines(jobs: list[dict]) -> None:
+    for job in jobs:
+        print(json.dumps({"url": job.get("url"), "title": job.get("title"), "site": job.get("site")}))
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -89,7 +95,7 @@ def run(
         help="Search keywords for HiringCafe discover (required when discover runs).",
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for enrichment."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
     validation: str = typer.Option(
@@ -127,8 +133,8 @@ def run(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
 
-    # Gate AI stages behind Tier 2
-    llm_stages = {"score", "tailor", "cover"}
+    # Gate remaining AI stages behind Tier 2 (score is Cursor-only)
+    llm_stages = {"tailor", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
         from applypilot.config import check_tier
         check_tier(2, "AI scoring/tailoring")
@@ -346,13 +352,70 @@ def dashboard() -> None:
     open_dashboard()
 
 
+@app.command("score-write")
+def score_write(
+    url: str = typer.Option(..., "--url", help="Job URL to score."),
+    score: int = typer.Option(..., "--score", help="Fit score 1-10."),
+    keywords: str = typer.Option(..., "--keywords", help="Comma-separated matching keywords."),
+    reasoning: str = typer.Option(..., "--reasoning", help="Score rationale."),
+) -> None:
+    """Persist a Cursor Score result for one job URL."""
+    _bootstrap()
+    from applypilot.scoring.scorer import write_score
+
+    try:
+        write_score(url, score, keywords, reasoning)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command("score-pending")
+def score_pending() -> None:
+    """List enriched jobs with no fit score (JSON lines: url, title, site)."""
+    _bootstrap()
+    from applypilot.scoring.scorer import list_pending_scores
+
+    _print_job_lines(list_pending_scores(limit=0))
+
+
+@app.command("enrich-write")
+def enrich_write(
+    url: str = typer.Option(..., "--url", help="Job URL to update."),
+    full_description: Optional[str] = typer.Option(
+        None, "--full-description", help="Full job description text."
+    ),
+    application_url: Optional[str] = typer.Option(
+        None, "--application-url", help="Apply URL."
+    ),
+) -> None:
+    """Persist Cursor leftover extraction for one job URL."""
+    _bootstrap()
+    from applypilot.enrichment.detail import write_enrich
+
+    try:
+        write_enrich(url, full_description=full_description, application_url=application_url)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command("enrich-leftovers")
+def enrich_leftovers() -> None:
+    """List jobs the Playwright cascade finished without a description."""
+    _bootstrap()
+    from applypilot.enrichment.detail import list_enrich_leftovers
+
+    _print_job_lines(list_enrich_leftovers(limit=0))
+
+
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, has_codex,
     )
 
     load_env()
@@ -394,20 +457,22 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    if (provider in ("", "codex")) and has_codex():
+        model = os.environ.get("LLM_MODEL", "gpt-5.6-luna")
+        effort = os.environ.get("LLM_REASONING_EFFORT", "high")
+        results.append(("LLM", ok_mark, f"Codex exec ({model}, {effort})"))
+    elif os.environ.get("GEMINI_API_KEY"):
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
+    elif os.environ.get("OPENAI_API_KEY"):
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
+    elif os.environ.get("LLM_URL"):
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM", fail_mark,
+                        "Install Codex CLI (`codex` on PATH) or set GEMINI_API_KEY"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI

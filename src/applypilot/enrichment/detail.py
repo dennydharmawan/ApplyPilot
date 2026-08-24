@@ -4,10 +4,11 @@ For each job URL in the database, navigates to the detail page and extracts:
   - full_description: the complete job posting text
   - application_url: the "Apply" button/link URL
 
-Three-tier extraction cascade (cheapest first):
-  Tier 1: JSON-LD JobPosting structured data (0 tokens)
-  Tier 2: Deterministic CSS pattern matching (0 tokens)
-  Tier 3: LLM-assisted extraction (1 LLM call)
+Two-tier extraction cascade:
+  Tier 1: JSON-LD JobPosting structured data
+  Tier 2: Deterministic CSS pattern matching
+
+Hard leftovers go to Cursor via write_enrich.
 """
 
 import json
@@ -22,10 +23,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
-from applypilot.llm import get_client
+from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -367,122 +365,6 @@ def extract_description_deterministic(page) -> str | None:
     return None
 
 
-# -- Tier 3: LLM extraction -------------------------------------------------
-
-DETAIL_EXTRACT_PROMPT = """You are extracting job details from a single job posting page.
-
-PAGE URL: {url}
-PAGE TITLE: {title}
-
-Find TWO things in the HTML below:
-1. The full job description text (responsibilities, requirements, etc.)
-2. The URL of the "Apply" button/link
-
-Rules:
-- For description: extract the FULL text. Include all sections (About, Responsibilities, Requirements, etc.)
-- For apply URL: find the href of the link/button that starts the application process
-- If you cannot find one, set it to null
-
-Return ONLY valid JSON:
-{{"full_description": "the complete job description text here", "application_url": "https://..." or null}}
-
-No explanation, no markdown. Keep reasoning under 20 words.
-
-HTML:
-{content}"""
-
-
-def extract_main_content(page) -> str:
-    """Extract the main content area, stripped of navigation noise."""
-    for sel in ["main", "article", '[role="main"]', "#content", ".content"]:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                text_len = len(el.inner_text().strip())
-                if text_len > 200:
-                    html = el.inner_html()
-                    if len(html) < 50000:
-                        return clean_content_html(html)
-        except Exception:
-            continue
-
-    try:
-        html = page.evaluate("""
-            () => {
-                const clone = document.body.cloneNode(true);
-                clone.querySelectorAll('nav, header, footer, script, style, noscript, svg, iframe').forEach(el => el.remove());
-                return clone.innerHTML;
-            }
-        """)
-        return clean_content_html(html[:50000])
-    except Exception:
-        return ""
-
-
-def clean_content_html(html: str) -> str:
-    """Clean detail page HTML for LLM consumption."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup.select("script, style, noscript, svg, iframe, nav, header, footer"):
-        tag.decompose()
-
-    for tag in soup.find_all(True):
-        new_attrs: dict = {}
-        for attr, val in list(tag.attrs.items()):
-            if attr in ("id", "href", "class", "role", "aria-label", "data-testid", "name", "for", "type"):
-                if attr == "class":
-                    classes = val if isinstance(val, list) else val.split()
-                    kept = [c for c in classes if len(c) < 30 and not re.match(r"^[a-z]{1,2}-\d+$", c)]
-                    if kept:
-                        new_attrs["class"] = " ".join(kept[:3])
-                else:
-                    new_attrs[attr] = val
-            elif attr.startswith("data-") or attr.startswith("aria-"):
-                new_attrs[attr] = val
-        tag.attrs = new_attrs
-
-    return str(soup)
-
-
-def extract_with_llm(page, url: str) -> dict:
-    """Send focused HTML to LLM for extraction. Fallback tier."""
-    content = extract_main_content(page)
-    if not content:
-        return {"full_description": None, "application_url": None}
-
-    title = ""
-    try:
-        title = page.title()
-    except Exception:
-        pass
-
-    prompt = DETAIL_EXTRACT_PROMPT.format(
-        url=url,
-        title=title,
-        content=content[:30000],
-    )
-
-    try:
-        client = get_client()
-        t0 = time.time()
-        raw = client.ask(prompt, temperature=0.0, max_tokens=4096)
-        elapsed = time.time() - t0
-        log.info("LLM: %d chars in, %.1fs", len(prompt), elapsed)
-
-        from applypilot.discovery.smartextract import extract_json
-        result = extract_json(raw)
-        desc = result.get("full_description")
-        apply_url = result.get("application_url")
-
-        if desc:
-            desc = clean_description(desc)
-
-        return {"full_description": desc, "application_url": apply_url}
-    except Exception as e:
-        log.error("LLM ERROR: %s", e)
-        return {"full_description": None, "application_url": None}
-
-
 # -- Description cleaning ---------------------------------------------------
 
 def clean_description(text: str) -> str:
@@ -545,6 +427,11 @@ def scrape_detail_page(page, url: str) -> dict:
             result["error"] = f"HTTP {resp.status}"
             result["elapsed"] = time.time() - t0
             return result
+        if resp and resp.status in RETRYABLE_STATUSES:
+            result["error"] = f"HTTP {resp.status}"
+            result["retryable"] = True
+            result["elapsed"] = time.time() - t0
+            return result
         page.wait_for_load_state("domcontentloaded", timeout=15000)
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
@@ -554,6 +441,7 @@ def scrape_detail_page(page, url: str) -> dict:
         err_str = str(e)
         if "timeout" in err_str.lower():
             result["error"] = "timeout"
+            result["retryable"] = True
         else:
             result["error"] = err_str[:200]
         result["elapsed"] = time.time() - t0
@@ -586,24 +474,107 @@ def scrape_detail_page(page, url: str) -> dict:
         result["elapsed"] = time.time() - t0
         return result
 
-    tier2_apply = apply
-
-    # Tier 3: LLM
-    llm_result = extract_with_llm(page, url)
-    result["full_description"] = llm_result.get("full_description")
-    result["application_url"] = llm_result.get("application_url") or tier2_apply
-    result["tier_used"] = 3
-
-    if result.get("full_description"):
-        result["status"] = "ok" if result.get("application_url") else "partial"
-    elif result.get("application_url"):
-        result["status"] = "partial"
-    else:
-        result["status"] = "error"
-        result["error"] = "no data extracted"
-
+    result["application_url"] = apply
+    result["status"] = "error"
+    result["error"] = "needs_cursor_extraction"
     result["elapsed"] = time.time() - t0
     return result
+
+
+def _commit_enrich_result(
+    conn: sqlite3.Connection,
+    url: str,
+    result: dict,
+    now: str,
+) -> None:
+    if result["status"] in ("ok", "partial"):
+        conn.execute(
+            "UPDATE jobs SET full_description = ?, "
+            "application_url = COALESCE(?, application_url), "
+            "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+            (
+                result.get("full_description"),
+                result.get("application_url") or None,
+                now,
+                url,
+            ),
+        )
+    elif result.get("retryable"):
+        # Leave detail_scraped_at null so pending_detail re-queues.
+        conn.execute(
+            "UPDATE jobs SET detail_error = ? WHERE url = ?",
+            (result.get("error", "unknown"), url),
+        )
+    else:
+        conn.execute(
+            "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
+            (result.get("error", "unknown"), now, url),
+        )
+    conn.commit()
+
+
+def write_enrich(
+    url: str,
+    full_description: str | None = None,
+    application_url: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    if not url:
+        raise ValueError("url is required")
+    desc = full_description if full_description else None
+    apply_url = application_url if application_url else None
+    if desc is None and apply_url is None:
+        raise ValueError("Need full_description or application_url")
+
+    if conn is None:
+        conn = get_connection()
+
+    if conn.execute("SELECT 1 FROM jobs WHERE url = ?", (url,)).fetchone() is None:
+        raise ValueError(f"Unknown job URL: {url}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET "
+        "full_description = COALESCE(?, full_description), "
+        "application_url = COALESCE(?, application_url), "
+        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+        (desc, apply_url, now, url),
+    )
+    conn.commit()
+
+
+def list_enrich_leftovers(
+    conn: sqlite3.Connection | None = None,
+    limit: int = 0,
+) -> list[dict]:
+    """Jobs the Playwright cascade finished without a usable description.
+
+    Retryable HTTP/timeout failures leave detail_scraped_at NULL and are not
+    included; they re-queue for the engine. Terminal failures stamp
+    detail_scraped_at, so they show up here for Cursor extraction.
+
+    SQL:
+        SELECT url, title, site FROM jobs
+        WHERE full_description IS NULL AND detail_scraped_at IS NOT NULL
+    """
+    if conn is None:
+        conn = get_connection()
+
+    query = (
+        "SELECT url, title, site FROM jobs "
+        "WHERE full_description IS NULL AND detail_scraped_at IS NOT NULL "
+        "ORDER BY discovered_at DESC"
+    )
+    params: list = []
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    if rows:
+        columns = rows[0].keys()
+        return [dict(zip(columns, row)) for row in rows]
+    return []
 
 
 def scrape_site_batch(
@@ -617,7 +588,7 @@ def scrape_site_batch(
 
     If conn is None, creates its own DB connection.
     """
-    stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0}}
 
     if max_jobs:
         jobs = jobs[:max_jobs]
@@ -663,19 +634,9 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
-                    conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
-                    )
                 else:
                     stats["error"] += 1
-                    conn.execute(
-                        "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
-                        (result.get("error", "unknown"), now, url),
-                    )
-
-                conn.commit()
+                _commit_enrich_result(conn, url, result, now)
 
                 if i < len(jobs) - 1:
                     time.sleep(delay)
@@ -730,7 +691,7 @@ def _run_detail_scraper(
     order = [s for s in known_order if s in site_jobs]
     order += [s for s in sorted(site_jobs.keys()) if s not in order]
 
-    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0}}
 
     def _merge_stats(stats: dict) -> None:
         for k in ("processed", "ok", "partial", "error"):
@@ -746,9 +707,9 @@ def _run_detail_scraper(
             delay = SITE_DELAYS.get(site, 2.0)
             log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
             stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
-            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d",
                      site, stats["ok"], stats["partial"], stats["error"],
-                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
+                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0))
             return stats
 
         with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
@@ -765,20 +726,14 @@ def _run_detail_scraper(
             stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
             _merge_stats(stats)
 
-            log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+            log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d",
                      stats["ok"], stats["partial"], stats["error"],
-                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
+                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0))
 
     log.info("TOTAL: %d processed | %d ok | %d partial | %d error",
              total_stats["processed"], total_stats["ok"], total_stats["partial"], total_stats["error"])
-    log.info("Tier distribution: T1=%d T2=%d T3=%d",
-             total_stats["tiers"].get(1, 0), total_stats["tiers"].get(2, 0), total_stats["tiers"].get(3, 0))
-
-    llm_calls = total_stats["tiers"].get(3, 0)
-    total = total_stats["processed"]
-    if total > 0:
-        savings = ((total - llm_calls) / total) * 100
-        log.info("LLM calls: %d/%d (%.0f%% saved)", llm_calls, total, savings)
+    log.info("Tier distribution: T1=%d T2=%d",
+             total_stats["tiers"].get(1, 0), total_stats["tiers"].get(2, 0))
 
     return total_stats
 
@@ -858,9 +813,8 @@ def stream_detail(
 def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     """Main entry point for detail page enrichment.
 
-    Fetches pending jobs from the database (those without full_description),
-    resolves relative URLs, then runs the three-tier extraction cascade on
-    each detail page.
+    Fetches pending jobs from the database (those without detail_scraped_at),
+    resolves relative URLs, then runs the JSON-LD then CSS extraction cascade.
 
     Args:
         limit: Maximum number of jobs per site to process.

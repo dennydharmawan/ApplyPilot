@@ -6,7 +6,7 @@ Usage (via CLI):
     applypilot run                        # all stages, sequential
     applypilot run --stream               # all stages, concurrent
     applypilot run discover enrich        # specific stages
-    applypilot run score tailor cover     # LLM-only stages
+    applypilot run score                  # errors; use Score Pipeline Skill
     applypilot run --dry-run              # preview without executing
 """
 
@@ -37,7 +37,7 @@ STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 STAGE_META: dict[str, dict] = {
     "discover": {"desc": "Job discovery (HiringCafe)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
-    "score":    {"desc": "LLM scoring (fit 1-10)"},
+    "score":    {"desc": "Score via Score Pipeline Skill"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
     "cover":    {"desc": "Cover letter generation"},
     "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
@@ -59,7 +59,7 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(query, workers: int = 1) -> dict:
+def _run_discover(query) -> dict:
     from applypilot.discovery.hiringcafe import run_discovery
 
     console.print("  [cyan]HiringCafe discover...[/cyan]")
@@ -86,14 +86,11 @@ def _run_enrich(workers: int = 1) -> dict:
 
 
 def _run_score() -> dict:
-    """Stage: LLM scoring — assign fit scores 1-10."""
-    try:
-        from applypilot.scoring.scorer import run_scoring
-        run_scoring()
-        return {"status": "ok"}
-    except Exception as e:
-        log.error("Scoring failed: %s", e)
-        return {"status": f"error: {e}"}
+    """Score is Cursor-only. The CLI stage exists so `run score` fails loudly."""
+    from applypilot.scoring.scorer import SCORE_REMOVED_MSG
+
+    console.print(f"[red]{SCORE_REMOVED_MSG}[/red]")
+    return {"status": f"error: {SCORE_REMOVED_MSG}"}
 
 
 def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
@@ -250,7 +247,7 @@ def _run_stage_streaming(
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["validation_mode"] = validation_mode
-    if stage in ("discover", "enrich"):
+    if stage == "enrich":
         kwargs["workers"] = workers
     if stage == "discover":
         kwargs["query"] = query
@@ -322,7 +319,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
+            if name == "enrich":
                 kwargs["workers"] = workers
             if name == "discover":
                 kwargs["query"] = query
