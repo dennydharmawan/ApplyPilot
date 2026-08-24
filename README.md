@@ -60,9 +60,9 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
-| **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
-| **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
+| **1. Discover** | HiringCafe (Indonesia Edition): Jakarta + Indonesia-eligible remote. Keywords via `--query`. Cursor skill: `.cursor/skills/discover` |
+| **2. Enrich** | Playwright JSON-LD then CSS. Hard leftovers extracted in Cursor via `enrich-write`. Skill: `.cursor/skills/enrich` |
+| **3. Score** | Cursor rates every job 1–10 (parallel Task subagents); persist with `score-write`. Skill: `.cursor/skills/score`. No API LLM scoring |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
@@ -129,13 +129,13 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Indonesia Edition live Board is HiringCafe only. Run via the Discover skill or `APPLYPILOT_DIR=<profile> applypilot run discover --query "..."`. Deduplicates by URL. JobSpy/Workday modules may exist on disk but are not the live Discover path.
 
 ### Enrich
-Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
+Visits each job URL for full description + apply URL. Cascade: JSON-LD, then CSS. Leftovers use Cursor + `applypilot enrich-write` (no API LLM extraction).
 
 ### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+Cursor scores every job 1–10 against resume, `profile.json`, and `standing-notes.md`. Persist with `applypilot score-write`. Open results with `applypilot dashboard`. `applypilot run score` is removed.
 
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
