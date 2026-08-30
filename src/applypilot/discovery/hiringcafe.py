@@ -7,12 +7,14 @@ import sqlite3
 import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import httpx
 
-from applypilot.database import get_connection, init_db
+from applypilot.config import PROFILE_PATH
+from applypilot.database import get_connection, init_db, store_jobs
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +58,10 @@ class EmptyQueryError(ValueError):
     pass
 
 
+class DiscoverLaneConfigError(ValueError):
+    pass
+
+
 class SsrFetchError(RuntimeError):
     pass
 
@@ -82,6 +88,32 @@ class Query:
         return cls(text)
 
 
+class DiscoverLane(str, Enum):
+    JAKARTA = "jakarta"
+    INDONESIA_ELIGIBLE_REMOTE = "indonesia_eligible_remote"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoverLanes:
+    values: frozenset[DiscoverLane]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, frozenset) or any(not isinstance(lane, DiscoverLane) for lane in self.values):
+            raise ValueError("DiscoverLanes requires a frozenset of DiscoverLane values")
+        if not self.values:
+            raise ValueError("DiscoverLanes must not be empty")
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        return tuple(lane.value for lane in DiscoverLane if lane in self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoverRequest:
+    query: Query
+    lanes: DiscoverLanes
+
+
 @dataclass(frozen=True, slots=True)
 class DiscoverResult:
     pages: int
@@ -91,21 +123,77 @@ class DiscoverResult:
     skipped: int
 
 
-def parse_run_query(raw: str | None, ordered_stages: Sequence[str]) -> Query | None:
+def _lane_config_error(profile_path: Path, detail: str) -> DiscoverLaneConfigError:
+    accepted = ", ".join(lane.value for lane in DiscoverLane)
+    return DiscoverLaneConfigError(
+        f"Invalid Discover lane configuration in {profile_path}: {detail}. "
+        "Set preferences.discover_lanes to a non-empty list with no duplicates. "
+        f"Accepted values: {accepted}"
+    )
+
+
+def _load_discover_lanes(profile_path: Path) -> DiscoverLanes:
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise _lane_config_error(profile_path, "profile file is missing") from exc
+    except json.JSONDecodeError as exc:
+        raise _lane_config_error(profile_path, "profile file is not valid JSON") from exc
+
+    if not isinstance(profile, dict):
+        raise _lane_config_error(profile_path, "profile must be a JSON object")
+    preferences = profile.get("preferences")
+    if not isinstance(preferences, dict) or "discover_lanes" not in preferences:
+        raise _lane_config_error(profile_path, "missing preferences.discover_lanes")
+
+    raw_lanes = preferences["discover_lanes"]
+    if not isinstance(raw_lanes, list):
+        raise _lane_config_error(profile_path, "preferences.discover_lanes must be a list")
+    if not raw_lanes:
+        raise _lane_config_error(profile_path, "preferences.discover_lanes must not be empty")
+
+    lanes: list[DiscoverLane] = []
+    for raw_lane in raw_lanes:
+        try:
+            lane = DiscoverLane(raw_lane)
+        except (TypeError, ValueError) as exc:
+            raise _lane_config_error(profile_path, f"unknown value {raw_lane!r}") from exc
+        if lane in lanes:
+            raise _lane_config_error(
+                profile_path,
+                f"preferences.discover_lanes must not contain duplicates ({lane.value!r})",
+            )
+        lanes.append(lane)
+    return DiscoverLanes(frozenset(lanes))
+
+
+def parse_run_query(
+    raw: str | None,
+    ordered_stages: Sequence[str],
+    *,
+    profile_path: Path = PROFILE_PATH,
+) -> DiscoverRequest | None:
     if "discover" not in ordered_stages:
         return None
-    return Query.parse(raw)
+    return DiscoverRequest(
+        query=Query.parse(raw),
+        lanes=_load_discover_lanes(profile_path),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _Search:
-    query: Query
+    request: DiscoverRequest
 
     @classmethod
-    def compile(cls, query: Query) -> _Search:
-        return cls(query=query)
+    def compile(cls, request: DiscoverRequest) -> _Search:
+        return cls(request=request)
 
     def search_state_json(self) -> str:
+        has_jakarta = DiscoverLane.JAKARTA in self.request.lanes.values
+        has_remote = DiscoverLane.INDONESIA_ELIGIBLE_REMOTE in self.request.lanes.values
+        workplace_types = list(_WORKPLACE_TYPES) if has_jakarta else ["Remote"]
+        flexible_regions = list(_FLEXIBLE_REGIONS) if has_remote else []
         state = {
             "locations": [
                 {
@@ -125,12 +213,12 @@ class _Search:
                     ],
                     "formatted_address": "Jakarta, Indonesia",
                     "population": 10609681,
-                    "workplace_types": list(_WORKPLACE_TYPES),
-                    "options": {"flexible_regions": list(_FLEXIBLE_REGIONS)},
+                    "workplace_types": workplace_types,
+                    "options": {"flexible_regions": flexible_regions},
                 }
             ],
-            "workplaceTypes": list(_WORKPLACE_TYPES),
-            "searchQuery": self.query.text,
+            "workplaceTypes": workplace_types,
+            "searchQuery": self.request.query.text,
             "dateFetchedPastNDays": _RECENCY_DAYS,
         }
         return json.dumps(state, separators=(",", ":"))
@@ -144,6 +232,7 @@ class _Search:
 class _ParsedPage:
     jobs: tuple[dict[str, Any], ...]
     is_last_page: bool
+    raw_hits: int
 
 
 def _valid_http_url(value: str | None) -> str | None:
@@ -220,7 +309,9 @@ def _hit_to_job(hit: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     company = v5.get("company_name")
-    site = str(company).strip() if company else None
+    site = str(company).strip() if company else ""
+    if not site:
+        return None
 
     return {
         "url": apply_url,
@@ -248,16 +339,20 @@ def _parse_ssr_html(html: str) -> _ParsedPage:
     if not isinstance(page_props, dict):
         raise SsrParseError("SSR response missing pageProps")
 
-    raw_hits = page_props.get("ssrHits") or []
+    raw_hits = _flatten_hits(page_props.get("ssrHits") or [])
     is_last_page = bool(page_props.get("ssrIsLastPage"))
 
     jobs: list[dict[str, Any]] = []
-    for hit in _flatten_hits(raw_hits):
+    for hit in raw_hits:
         job = _hit_to_job(hit)
         if job is not None:
             jobs.append(job)
 
-    return _ParsedPage(jobs=tuple(jobs), is_last_page=is_last_page)
+    return _ParsedPage(
+        jobs=tuple(jobs),
+        is_last_page=is_last_page,
+        raw_hits=len(raw_hits),
+    )
 
 
 def _fetch_ssr(client: httpx.Client, search: _Search, page: int) -> str:
@@ -277,39 +372,16 @@ def _persist(
     conn: sqlite3.Connection,
     jobs: Sequence[dict[str, Any]],
 ) -> tuple[int, int, int]:
-    now = datetime.now(timezone.utc).isoformat()
-    inserted = 0
-    duplicates = 0
     skipped = 0
-
+    storable: list[dict[str, Any]] = []
     for job in jobs:
-        url = job.get("url")
-        if not url:
+        if job.get("url"):
+            storable.append(job)
+        else:
             skipped += 1
-            continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs "
-                "(url, title, salary, description, location, site, strategy, "
-                "discovered_at, application_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    url,
-                    job.get("title"),
-                    job.get("salary"),
-                    job.get("description"),
-                    job.get("location"),
-                    job.get("site"),
-                    job.get("strategy", _STRATEGY),
-                    now,
-                    job.get("application_url"),
-                ),
-            )
-            inserted += 1
-        except sqlite3.IntegrityError:
-            duplicates += 1
-
-    conn.commit()
+    inserted, duplicates = store_jobs(
+        conn, storable, site="", strategy=_STRATEGY
+    )
     return inserted, duplicates, skipped
 
 
@@ -335,8 +407,13 @@ def _crawl(
         duplicates += page_duplicates
         skipped += page_skipped
 
-        if parsed.is_last_page or not parsed.jobs:
+        if parsed.is_last_page or parsed.raw_hits == 0:
             break
+    else:
+        log.warning(
+            "HiringCafe crawl stopped at %s-page cap before ssrIsLastPage",
+            _MAX_PAGES,
+        )
 
     return DiscoverResult(
         pages=pages,
@@ -348,7 +425,7 @@ def _crawl(
 
 
 def run_discovery(
-    query: Query,
+    request: DiscoverRequest,
     *,
     conn: sqlite3.Connection | None = None,
 ) -> DiscoverResult:
@@ -356,7 +433,7 @@ def run_discovery(
     if conn is None:
         init_db()
 
-    search = _Search.compile(query)
+    search = _Search.compile(request)
     with httpx.Client(
         timeout=30.0,
         follow_redirects=True,

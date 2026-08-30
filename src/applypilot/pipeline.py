@@ -464,7 +464,8 @@ def run_pipeline(
     if dry_run:
         console.print(f"\n  [yellow]DRY RUN[/yellow] — would execute ({mode}):")
         if "discover" in ordered and query is not None:
-            console.print(f"    discover query: {query.text}")
+            console.print(f"    discover query: {query.query.text}")
+            console.print(f"    discover lanes: {', '.join(query.lanes.labels)}")
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")

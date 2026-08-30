@@ -173,6 +173,9 @@ def _setup_profile() -> dict:
     profile["availability"] = {
         "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
     }
+    profile["preferences"] = {
+        "discover_lanes": ["jakarta", "indonesia_eligible_remote"],
+    }
 
     # Save
     PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")

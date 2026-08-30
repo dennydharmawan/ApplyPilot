@@ -26,6 +26,7 @@ APPLYPILOT_DIR=<profile> applypilot run discover --query "<keywords>"
 
 ## Facts
 
-- Live Board is HiringCafe only (Jakarta + Indonesia-eligible remote lanes, ~3-day window). Hardcoded in the engine.
+- Live Board is HiringCafe only with a ~3-day window.
+- `preferences.discover_lanes` in the active Profile selects `jakarta`, `indonesia_eligible_remote`, or both.
 - Keywords come from `--query`, not `searches.yaml`.
 - See root `CONTEXT.md` for Edition terms.

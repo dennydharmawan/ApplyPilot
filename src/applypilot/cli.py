@@ -112,8 +112,12 @@ def run(
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
 
-    from applypilot.discovery.hiringcafe import EmptyQueryError, parse_run_query
-    from applypilot.pipeline import run_pipeline, _resolve_stages
+    from applypilot.discovery.hiringcafe import (
+        DiscoverLaneConfigError,
+        EmptyQueryError,
+        parse_run_query,
+    )
+    from applypilot.pipeline import _resolve_stages, run_pipeline
 
     stage_list = stages if stages else ["all"]
 
@@ -129,7 +133,7 @@ def run(
     ordered = _resolve_stages(stage_list)
     try:
         discover_query = parse_run_query(query, ordered)
-    except EmptyQueryError as exc:
+    except (EmptyQueryError, DiscoverLaneConfigError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
 

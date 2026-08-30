@@ -332,9 +332,11 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 
     Args:
         conn: Database connection.
-        jobs: List of job dicts with keys: url, title, salary, description, location.
-        site: Source site name (e.g. "RemoteOK", "Dice").
-        strategy: Extraction strategy used (e.g. "json_ld", "api_response", "css_selectors").
+        jobs: List of job dicts with keys: url, title, salary, description,
+            location. Optional per-job site, strategy, and application_url
+            override the function arguments.
+        site: Fallback site when a job dict has none.
+        strategy: Fallback strategy when a job dict has none.
 
     Returns:
         Tuple of (new_count, duplicate_count).
@@ -349,10 +351,20 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
+                "discovered_at, application_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    url,
+                    job.get("title"),
+                    job.get("salary"),
+                    job.get("description"),
+                    job.get("location"),
+                    job.get("site") or site,
+                    job.get("strategy") or strategy,
+                    now,
+                    job.get("application_url"),
+                ),
             )
             new += 1
         except sqlite3.IntegrityError:
