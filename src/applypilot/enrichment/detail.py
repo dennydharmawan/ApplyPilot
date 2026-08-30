@@ -500,7 +500,6 @@ def _commit_enrich_result(
             ),
         )
     elif result.get("retryable"):
-        # Leave detail_scraped_at null so pending_detail re-queues.
         conn.execute(
             "UPDATE jobs SET detail_error = ? WHERE url = ?",
             (result.get("error", "unknown"), url),
