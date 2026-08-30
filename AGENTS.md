@@ -1,10 +1,10 @@
 # ApplyPilot agents
 
-Set `APPLYPILOT_DIR` to the Profile (`profiles/<slug>/` in this checkout, or `~/.applypilot/profiles/<slug>/`). Pipin: `profiles/pipin/`. Export it in the process env before `applypilot` (import-time).
+Set `APPLYPILOT_DIR` to the Profile (`profiles/<slug>/` in this checkout, or `~/.applypilot/profiles/<slug>/`). Denny: `profiles/denny/`. Pipin: `profiles/pipin/`. Export it in the process env before `applypilot` (import-time).
 
 ## Pipeline Skills
 
-Primary UX for Discover → Enrich → Score is `.cursor/skills/`:
+Primary UX for Discover → Enrich → Score is `.cursor/skills/` (Codex: `.codex/skills` → same dir via symlink):
 
 | Skill | Role |
 |--------|------|
@@ -13,7 +13,9 @@ Primary UX for Discover → Enrich → Score is `.cursor/skills/`:
 | `score` | Parallel Cursor judgment → `score-write` → `dashboard` |
 | `standing-notes` | Profile `/remember` → `standing-notes.md` / `profile.json` |
 
-`applypilot run score` is removed (API LLM scoring is gone). Tailor/Cover/Apply are unchanged for now.
+`applypilot run score` is removed (API LLM scoring is gone).
+
+Before creating, changing, or uploading a resume for a job application, read `.cursor/skills/resume-tailoring/SKILL.md`. Use `$APPLYPILOT_DIR/resumes/` as the resume bank and `/Users/denny.dharmawan/portfolios/personal-site/public/resume.pdf` as the golden resume.
 
 ## Scoring results
 

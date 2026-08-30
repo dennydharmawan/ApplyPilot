@@ -46,3 +46,14 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Repo-local agent instructions
+!.cursor/
+.cursor/*
+!.cursor/skills/
+.cursor/skills/*
+!.cursor/skills/resume-tailoring/
+!.cursor/skills/resume-tailoring/**
+!.cursor/skills/verify-applypilot/
+!.cursor/skills/verify-applypilot/**
+!CLAUDE.md
