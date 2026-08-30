@@ -248,16 +248,23 @@ def _setup_ai_features() -> None:
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
+    console.print("Supported providers: [bold]Codex[/bold] (default), Gemini, OpenAI, local (Ollama/llama.cpp)")
+    default_provider = "codex" if shutil.which("codex") else "gemini"
     provider = Prompt.ask(
         "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
+        choices=["codex", "gemini", "openai", "local"],
+        default=default_provider,
     )
 
     env_lines = ["# ApplyPilot configuration", ""]
 
-    if provider == "gemini":
+    if provider == "codex":
+        env_lines.append("LLM_PROVIDER=codex")
+        env_lines.append("LLM_MODEL=gpt-5.6-luna")
+        env_lines.append("LLM_REASONING_EFFORT=high")
+        if not shutil.which("codex"):
+            console.print("[yellow]Codex CLI not found on PATH.[/yellow] Install Codex, then re-run doctor.")
+    elif provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")

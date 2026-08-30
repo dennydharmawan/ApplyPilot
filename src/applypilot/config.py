@@ -197,17 +197,22 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
-def get_tier() -> int:
-    """Detect the current tier based on available dependencies.
+def has_codex() -> bool:
+    return shutil.which("codex") is not None
 
-    Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
-    """
+
+def has_llm() -> bool:
+    load_env()
+    provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    if provider in ("", "codex") and has_codex():
+        return True
+    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+
+
+def get_tier() -> int:
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
-    if not has_llm:
+    if not has_llm():
         return 1
 
     has_claude = shutil.which("claude") is not None
@@ -238,8 +243,8 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not has_llm():
+        missing.append("Codex CLI (`codex` on PATH) or an LLM API key")
     if required >= 3:
         if not shutil.which("claude"):
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")

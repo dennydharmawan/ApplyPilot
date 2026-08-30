@@ -1,99 +1,121 @@
-"""
-Unified LLM client for ApplyPilot.
-
-Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
-  OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
-
-LLM_MODEL env var overrides the model name for any provider.
-"""
+from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
+from pathlib import Path
 
 import httpx
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Provider detection
-# ---------------------------------------------------------------------------
-
-def _detect_provider() -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables.
-
-    Reads env at call time (not module import time) so that load_env() called
-    in _bootstrap() is always visible here.
-    """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    local_url = os.environ.get("LLM_URL", "")
-    model_override = os.environ.get("LLM_MODEL", "")
-
-    if gemini_key and not local_url:
-        return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
-            gemini_key,
-        )
-
-    if openai_key and not local_url:
-        return (
-            "https://api.openai.com/v1",
-            model_override or "gpt-4o-mini",
-            openai_key,
-        )
-
-    if local_url:
-        return (
-            local_url.rstrip("/"),
-            model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
-        )
-
-    raise RuntimeError(
-        "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
-
+_CODEX_MODEL = "gpt-5.6-luna"
+_CODEX_REASONING = "high"
+_CODEX_TIMEOUT = 300
 _MAX_RETRIES = 5
-_TIMEOUT = 120  # seconds
-
-# Base wait on first 429/503 (doubles each retry, caps at 60s).
-# Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
+_TIMEOUT = 120
 _RATE_LIMIT_BASE_WAIT = 10
-
-
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
+def _messages_to_prompt(messages: list[dict]) -> str:
+    parts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "user")).upper()
+        content = str(msg.get("content", ""))
+        parts.append(f"{role}:\n{content}")
+    parts.append(
+        "Reply with only the requested output. Do not use tools or edit files."
+    )
+    return "\n\n".join(parts)
+
+
+class CodexExecClient:
+    def __init__(
+        self,
+        binary: str,
+        model: str,
+        reasoning_effort: str,
+        timeout: int = _CODEX_TIMEOUT,
+    ) -> None:
+        self.binary = binary
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.timeout = timeout
+
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> str:
+        del temperature, max_tokens
+        prompt = _messages_to_prompt(messages)
+        with tempfile.TemporaryDirectory(prefix="applypilot-codex-") as tmp:
+            last_path = Path(tmp) / "last.txt"
+            cmd = [
+                self.binary,
+                "exec",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--ignore-user-config",
+                "--color",
+                "never",
+                "-m",
+                self.model,
+                "-c",
+                f'model_reasoning_effort="{self.reasoning_effort}"',
+                "-C",
+                tmp,
+                "-o",
+                str(last_path),
+                "-",
+            ]
+            log.info("LLM provider: codex exec  model: %s  effort: %s", self.model, self.reasoning_effort)
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"codex exec timed out after {self.timeout}s"
+                ) from exc
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()[-500:]
+                raise RuntimeError(f"codex exec exited {proc.returncode}: {err}")
+            if not last_path.exists():
+                raise RuntimeError("codex exec produced no last-message file")
+            text = last_path.read_text(encoding="utf-8").strip()
+            if not text:
+                raise RuntimeError("codex exec last message was empty")
+            return text
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self) -> None:
+        return
+
+
 class LLMClient:
-    """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
-
-    For Gemini keys, starts on the OpenAI-compat layer. On a 403 (which
-    happens with preview/experimental models not exposed via compat), it
-    automatically switches to the native generateContent API and stays there
-    for the lifetime of the process.
-    """
-
     def __init__(self, base_url: str, model: str, api_key: str) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
         self._client = httpx.Client(timeout=_TIMEOUT)
-        # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
-
-    # -- Native Gemini API --------------------------------------------------
 
     def _chat_native_gemini(
         self,
@@ -101,14 +123,6 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Call the native Gemini generateContent API.
-
-        Used automatically when the OpenAI-compat endpoint returns 403,
-        which happens for preview/experimental models not exposed via compat.
-
-        Converts OpenAI-style messages to Gemini's contents/systemInstruction
-        format transparently.
-        """
         contents: list[dict] = []
         system_parts: list[dict] = []
 
@@ -120,7 +134,6 @@ class LLMClient:
             elif role == "user":
                 contents.append({"role": "user", "parts": [{"text": text}]})
             elif role == "assistant":
-                # Gemini uses "model" instead of "assistant"
                 contents.append({"role": "model", "parts": [{"text": text}]})
 
         payload: dict = {
@@ -144,15 +157,12 @@ class LLMClient:
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    # -- OpenAI-compat API --------------------------------------------------
-
     def _chat_compat(
         self,
         messages: list[dict],
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Call the OpenAI-compatible endpoint."""
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -170,8 +180,6 @@ class LLMClient:
             headers=headers,
         )
 
-        # 403 on Gemini compat = model not available on compat layer.
-        # Raise a specific sentinel so chat() can switch to native API.
         if resp.status_code == 403 and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
@@ -183,17 +191,12 @@ class LLMClient:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    # -- public API ---------------------------------------------------------
-
     def chat(
         self,
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 4096,
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
-        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
             first = messages[0]
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
@@ -201,22 +204,18 @@ class LLMClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
+            except _GeminiCompatForbidden:
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
+                    "Switching to native generateContent API.",
                     self.model,
                 )
                 self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
                 try:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
                 except httpx.HTTPStatusError as native_exc:
@@ -229,7 +228,6 @@ class LLMClient:
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
                         or resp.headers.get("X-RateLimit-Reset-Requests")
@@ -243,9 +241,7 @@ class LLMClient:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
 
                     log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Tip: Gemini free tier = 15 RPM. Consider a paid account "
-                        "or switching to a local model.",
+                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d.",
                         resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
@@ -266,7 +262,6 @@ class LLMClient:
         raise RuntimeError("LLM request failed after all retries")
 
     def ask(self, prompt: str, **kwargs) -> str:
-        """Convenience: single user prompt -> assistant response."""
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
 
     def close(self) -> None:
@@ -274,24 +269,81 @@ class LLMClient:
 
 
 class _GeminiCompatForbidden(Exception):
-    """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
         super().__init__(f"Gemini compat 403: {response.text[:200]}")
 
 
-# ---------------------------------------------------------------------------
-# Singleton
-# ---------------------------------------------------------------------------
-
-_instance: LLMClient | None = None
+_instance = None
 
 
-def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
+def _forced_provider() -> str:
+    return os.environ.get("LLM_PROVIDER", "").strip().lower()
+
+
+def _http_provider() -> tuple[str, str, str] | None:
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    local_url = os.environ.get("LLM_URL", "")
+    model_override = os.environ.get("LLM_MODEL", "")
+    forced = _forced_provider()
+
+    if forced == "gemini" or (not forced and gemini_key and not local_url):
+        if not gemini_key:
+            return None
+        return (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            model_override or "gemini-2.0-flash",
+            gemini_key,
+        )
+
+    if forced == "openai" or (not forced and openai_key and not local_url):
+        if not openai_key:
+            return None
+        return (
+            "https://api.openai.com/v1",
+            model_override or "gpt-4o-mini",
+            openai_key,
+        )
+
+    if forced == "local" or local_url:
+        if not local_url:
+            return None
+        return (
+            local_url.rstrip("/"),
+            model_override or "local-model",
+            os.environ.get("LLM_API_KEY", ""),
+        )
+
+    return None
+
+
+def get_client():
     global _instance
-    if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+    if _instance is not None:
+        return _instance
+
+    forced = _forced_provider()
+    codex_bin = shutil.which("codex")
+    use_codex = forced == "codex" or (not forced and codex_bin)
+
+    if use_codex:
+        if not codex_bin:
+            raise RuntimeError("LLM_PROVIDER=codex but `codex` is not on PATH")
+        _instance = CodexExecClient(
+            binary=codex_bin,
+            model=os.environ.get("LLM_MODEL", _CODEX_MODEL),
+            reasoning_effort=os.environ.get("LLM_REASONING_EFFORT", _CODEX_REASONING),
+        )
+        return _instance
+
+    http = _http_provider()
+    if http is None:
+        raise RuntimeError(
+            "No LLM provider configured. Install Codex CLI (`codex` on PATH) "
+            "or set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL."
+        )
+    base_url, model, api_key = http
+    log.info("LLM provider: %s  model: %s", base_url, model)
+    _instance = LLMClient(base_url, model, api_key)
     return _instance

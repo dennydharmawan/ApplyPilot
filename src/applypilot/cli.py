@@ -137,11 +137,10 @@ def run(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
 
-    # Gate remaining AI stages behind Tier 2 (score is Cursor-only)
-    llm_stages = {"tailor", "cover"}
-    if any(s in stage_list for s in llm_stages) or "all" in stage_list:
+    tier_2_stages = {"tailor", "cover"}
+    if any(s in stage_list for s in tier_2_stages) or "all" in stage_list:
         from applypilot.config import check_tier
-        check_tier(2, "AI scoring/tailoring")
+        check_tier(2, "AI tailoring/cover letters")
 
     # Validate the --validation flag value
     valid_modes = ("strict", "normal", "lenient")
