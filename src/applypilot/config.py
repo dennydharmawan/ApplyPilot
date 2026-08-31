@@ -17,8 +17,7 @@ SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 
 # Generated output
-TAILORED_DIR = APP_DIR / "tailored_resumes"
-COVER_LETTER_DIR = APP_DIR / "cover_letters"
+RESUME_APPLICATIONS_DIR = APP_DIR / "resumes" / "applications"
 LOG_DIR = APP_DIR / "logs"
 
 # Chrome worker isolation
@@ -87,7 +86,7 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [APP_DIR, RESUME_APPLICATIONS_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -162,9 +161,8 @@ def load_base_urls() -> dict[str, str | None]:
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
-    "min_score": 7,
+    "min_score": 6,
     "max_apply_attempts": 3,
-    "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
@@ -186,13 +184,20 @@ def load_env():
 
 TIER_LABELS = {
     1: "Discovery",
-    2: "AI Scoring & Tailoring",
+    2: "Agent Scoring & Preparation",
     3: "Full Auto-Apply",
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
     1: ["init", "run discover", "run enrich", "status", "dashboard"],
-    2: ["run score", "run tailor", "run cover", "run pdf", "run"],
+    2: [
+        "score-pending",
+        "prepare-queue",
+        "prepare-select",
+        "prepare-selected",
+        "prepare-write",
+        "prepare-fail",
+    ],
     3: ["apply"],
 }
 

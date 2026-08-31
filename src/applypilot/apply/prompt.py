@@ -9,7 +9,6 @@ import logging
 import os
 import shutil
 from datetime import datetime
-from pathlib import Path
 
 from applypilot import config
 
@@ -196,7 +195,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -417,9 +415,7 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
-def build_prompt(job: dict, tailored_resume: str,
-                 cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+def build_prompt(job: dict, dry_run: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -427,9 +423,7 @@ def build_prompt(job: dict, tailored_resume: str,
 
     Args:
         job: Job dict from the database (must have url, title, site,
-             application_url, fit_score, tailored_resume_path).
-        tailored_resume: Plain-text content of the tailored resume.
-        cover_letter: Optional plain-text cover letter content.
+             application_url, fit_score, application_bundle_path).
         dry_run: If True, tell the agent not to click Submit.
 
     Returns:
@@ -439,14 +433,17 @@ def build_prompt(job: dict, tailored_resume: str,
     search_config = config.load_search_config()
     personal = profile["personal"]
 
-    # --- Resolve resume PDF path ---
-    resume_path = job.get("tailored_resume_path")
-    if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+    from applypilot.preparation import load_application_bundle
 
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
-    if not src_pdf.exists():
-        raise ValueError(f"Resume PDF not found: {src_pdf}")
+    bundle_path = job.get("application_bundle_path")
+    if not bundle_path:
+        raise ValueError(f"No Application Bundle for job: {job.get('title', 'unknown')}")
+    bundle = load_application_bundle(
+        bundle_path,
+        expected_url=job.get("url"),
+        expected_digest=job.get("application_bundle_digest"),
+    )
+    tailored_resume = bundle.resume_text.read_text(encoding="utf-8")
 
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
@@ -454,27 +451,17 @@ def build_prompt(job: dict, tailored_resume: str,
     dest_dir = config.APPLY_WORKER_DIR / "current"
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
-    shutil.copy(str(src_pdf), str(upload_pdf))
+    shutil.copy(str(bundle.resume_pdf), str(upload_pdf))
     pdf_path = str(upload_pdf)
 
     # --- Cover letter handling ---
-    cover_letter_text = cover_letter or ""
+    cover_letter_text = ""
     cl_upload_path = ""
-    cl_path = job.get("cover_letter_path")
-    if cl_path and Path(cl_path).exists():
-        cl_src = Path(cl_path)
-        # Read text from .txt sibling (PDF is binary)
-        cl_txt = cl_src.with_suffix(".txt")
-        if cl_txt.exists():
-            cover_letter_text = cl_txt.read_text(encoding="utf-8")
-        elif cl_src.suffix == ".txt":
-            cover_letter_text = cl_src.read_text(encoding="utf-8")
-        # Upload must be PDF
-        cl_pdf_src = cl_src.with_suffix(".pdf")
-        if cl_pdf_src.exists():
-            cl_upload = dest_dir / f"{name_slug}_Cover_Letter.pdf"
-            shutil.copy(str(cl_pdf_src), str(cl_upload))
-            cl_upload_path = str(cl_upload)
+    if bundle.cover_letter_text and bundle.cover_letter_pdf:
+        cover_letter_text = bundle.cover_letter_text.read_text(encoding="utf-8")
+        cl_upload = dest_dir / f"{name_slug}_Cover_Letter.pdf"
+        shutil.copy(str(bundle.cover_letter_pdf), str(cl_upload))
+        cl_upload_path = str(cl_upload)
 
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
@@ -484,14 +471,8 @@ def build_prompt(job: dict, tailored_resume: str,
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
-    # Cover letter fallback text
-    city = personal.get("city", "the area")
     if not cover_letter_text:
-        cl_display = (
-            f"None available. Skip if optional. If required, write 2 factual "
-            f"sentences: (1) relevant experience from the resume that matches "
-            f"this role, (2) available immediately and based in {city}."
-        )
+        cl_display = "None prepared. Skip if optional. If required, output RESULT:FAILED:missing_prepared_cover_letter."
     else:
         cl_display = cover_letter_text
 
@@ -545,7 +526,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
 - NEVER set up a freelancing profile (Mercor, Toptal, Upwork, Fiverr, Turing, etc.). These are contractor marketplaces, not job applications -> RESULT:FAILED:not_a_job_application
-- NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows. You are applying for FULL-TIME salaried positions only.
+- Full-time, contract, and freelance engagements are all allowed when the posting offers them. Never invent or accept compensation, rates, or availability that are not supported by the active Profile.
+- Do not create marketplace or talent-profile accounts. Apply only to the specific prepared job.
 - NEVER install browser extensions, download executables, or run assessment software.
 - NEVER enter payment info, bank details, or SSN/SIN.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
@@ -562,7 +544,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
-   - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
+   - If Cover Letter PDF is N/A, output RESULT:FAILED:missing_prepared_cover_letter.
+   - Otherwise send_email with subject "Application for {job['title']} -- {display_name}", body = the prepared cover letter text, attach resume PDF and prepared cover letter PDF.
    - Output RESULT:APPLIED. Done.
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
 5. Login wall?
@@ -575,7 +558,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
-7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
+7. Upload cover letter if there's a field for it. If none was prepared, output RESULT:FAILED:missing_prepared_cover_letter. Text field -> paste the prepared text. File upload -> use the prepared PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.

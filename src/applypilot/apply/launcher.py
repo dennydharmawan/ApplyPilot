@@ -25,7 +25,7 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -87,7 +87,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # Database operations
 # ---------------------------------------------------------------------------
 
-def acquire_job(target_url: str | None = None, min_score: int = 7,
+def acquire_job(target_url: str | None = None, min_score: int = 6,
                 worker_id: int = 0) -> dict | None:
     """Atomically acquire the next job to apply to.
 
@@ -106,12 +106,13 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT url, title, site, application_url, application_bundle_path,
+                       application_bundle_digest,
+                       fit_score, location, full_description
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND application_bundle_path IS NOT NULL
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -125,13 +126,14 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT url, title, site, application_url, application_bundle_path,
+                       application_bundle_digest,
+                       fit_score, location, full_description
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
+                WHERE application_bundle_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
@@ -210,7 +212,7 @@ def release_lock(url: str) -> None:
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
-def gen_prompt(target_url: str, min_score: int = 7,
+def gen_prompt(target_url: str, min_score: int = 6,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
@@ -221,14 +223,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if not job:
         return None
 
-    # Read resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = prompt_mod.build_prompt(job=job)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -303,17 +298,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
-    # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
-        tailored_resume=resume_text,
         dry_run=dry_run,
     )
 
@@ -547,7 +534,7 @@ def _is_permanent_failure(result: str) -> bool:
 
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
-                min_score: int = 7, headless: bool = False,
+                min_score: int = 6, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
@@ -651,7 +638,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 6, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.

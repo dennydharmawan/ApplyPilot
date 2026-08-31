@@ -27,7 +27,7 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_STAGES = ("discover", "enrich", "score")
 
 
 # ---------------------------------------------------------------------------
@@ -94,22 +94,11 @@ def run(
         "--query",
         help="Search keywords for HiringCafe discover (required when discover runs).",
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for enrichment."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
-    validation: str = typer.Option(
-        "normal",
-        "--validation",
-        help=(
-            "Validation strictness for tailor/cover stages. "
-            "strict: banned words = errors, judge must pass. "
-            "normal: banned words = warnings only (default, recommended for Gemini free tier). "
-            "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
-        ),
-    ),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    """Run pipeline stages: discover, enrich, score."""
     _bootstrap()
 
     from applypilot.discovery.hiringcafe import (
@@ -137,27 +126,11 @@ def run(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
 
-    tier_2_stages = {"tailor", "cover"}
-    if any(s in stage_list for s in tier_2_stages) or "all" in stage_list:
-        from applypilot.config import check_tier
-        check_tier(2, "AI tailoring/cover letters")
-
-    # Validate the --validation flag value
-    valid_modes = ("strict", "normal", "lenient")
-    if validation not in valid_modes:
-        console.print(
-            f"[red]Invalid --validation value:[/red] '{validation}'. "
-            f"Choose from: {', '.join(valid_modes)}"
-        )
-        raise typer.Exit(code=1)
-
     result = run_pipeline(
         stages=stage_list,
-        min_score=min_score,
         dry_run=dry_run,
         stream=stream,
         workers=workers,
-        validation_mode=validation,
         query=discover_query,
     )
 
@@ -169,7 +142,7 @@ def run(
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
+    min_score: int = typer.Option(6, "--min-score", help="Minimum fit score for prepared job selection."),
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
@@ -220,21 +193,21 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: Application Bundles exist (skip for --gen with --url)
     if not (gen and url):
         conn = get_connection()
         ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+            "SELECT COUNT(*) FROM jobs WHERE application_bundle_path IS NOT NULL AND applied_at IS NULL"
         ).fetchone()[0]
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+                "[red]No Application Bundles ready.[/red]\n"
+                "Approve an exact Preparation selection and run the Prepare Pipeline Skill first."
             )
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -245,7 +218,7 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
             f"  claude --model {model} -p "
             f"--mcp-config {mcp_path} "
@@ -299,11 +272,10 @@ def status() -> None:
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
-    summary.add_row("Scored by LLM", str(stats["scored"]))
+    summary.add_row("Scored jobs", str(stats["scored"]))
     summary.add_row("Pending scoring", str(stats["unscored"]))
-    summary.add_row("Tailored resumes", str(stats["tailored"]))
-    summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
-    summary.add_row("Cover letters", str(stats["with_cover_letter"]))
+    summary.add_row("Preparation queue (6+)", str(stats["preparation_eligible"]))
+    summary.add_row("Prepared bundles", str(stats["prepared"]))
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
@@ -382,6 +354,76 @@ def score_pending() -> None:
     _print_job_lines(list_pending_scores(limit=0))
 
 
+@app.command("prepare-queue")
+def prepare_queue() -> None:
+    """List score-eligible jobs awaiting explicit Preparation approval."""
+    _bootstrap()
+    from applypilot.preparation import list_preparation_queue
+
+    for job in list_preparation_queue():
+        print(json.dumps(job))
+
+
+@app.command("prepare-select")
+def prepare_select(
+    urls: list[str] = typer.Option(..., "--url", help="Approved job URL. Repeat for each exact selection."),
+) -> None:
+    """Record one exact Profile-scoped Preparation selection."""
+    _bootstrap()
+    from applypilot.preparation import SelectionError, record_preparation_selection
+
+    try:
+        selection_id = record_preparation_selection(urls)
+    except SelectionError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Recorded Preparation selection {selection_id} with {len(urls)} job(s).[/green]")
+
+
+@app.command("prepare-selected")
+def prepare_selected() -> None:
+    """List only jobs in the active approved Preparation selection."""
+    _bootstrap()
+    from applypilot.preparation import list_selected_jobs
+
+    for job in list_selected_jobs():
+        print(json.dumps(job))
+
+
+@app.command("prepare-write")
+def prepare_write(
+    url: str = typer.Option(..., "--url", help="Selected job URL."),
+    bundle: str = typer.Option(..., "--bundle", help="Path to the completed bundle.json."),
+) -> None:
+    """Validate and register one selected job's Application Bundle."""
+    _bootstrap()
+    from applypilot.preparation import BundleValidationError, SelectionError, register_application_bundle
+
+    try:
+        registered = register_application_bundle(url, bundle)
+    except (BundleValidationError, SelectionError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Registered Application Bundle:[/green] {registered.manifest_path}")
+
+
+@app.command("prepare-fail")
+def prepare_fail(
+    url: str = typer.Option(..., "--url", help="Selected job URL."),
+    reason: str = typer.Option(..., "--reason", help="Concrete terminal preparation failure."),
+) -> None:
+    """Record one selected job's terminal Preparation failure."""
+    _bootstrap()
+    from applypilot.preparation import SelectionError, record_preparation_failure
+
+    try:
+        record_preparation_failure(url, reason)
+    except SelectionError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[yellow]Recorded Preparation failure:[/yellow] {url}")
+
+
 @app.command("enrich-write")
 def enrich_write(
     url: str = typer.Option(..., "--url", help="Job URL to update."),
@@ -418,7 +460,7 @@ def doctor() -> None:
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, has_codex,
+        SEARCH_CONFIG_PATH, get_chrome_path, has_codex,
     )
 
     load_env()
@@ -527,7 +569,7 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: agent scoring and Preparation[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")

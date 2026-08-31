@@ -54,6 +54,11 @@ Thumbs.db
 .cursor/skills/*
 !.cursor/skills/resume-tailoring/
 !.cursor/skills/resume-tailoring/**
+!.cursor/skills/prepare/
+!.cursor/skills/prepare/**
 !.cursor/skills/verify-applypilot/
 !.cursor/skills/verify-applypilot/**
+!docs/
+!docs/specs/
+!docs/specs/2026-08-30-prepare-pipeline-design.md
 !CLAUDE.md

@@ -1,8 +1,8 @@
 ---
 name: verify-applypilot
 description: >-
-  Drive ApplyPilot through its CLI and verify Discover, Enrich, Score, and
-  dashboard behavior with command transcripts and database evidence.
+  Drive ApplyPilot through its CLI and verify Discover, Enrich, Score, Prepare,
+  and dashboard behavior with command transcripts, files, and database evidence.
 ---
 
 # Verify ApplyPilot
@@ -19,7 +19,8 @@ uv run applypilot --help
 ```
 
 The help command must exit `0` and list `run`, `score-pending`, `score-write`,
-and `dashboard`. There is no background process to stop.
+`prepare-queue`, `prepare-select`, `prepare-write`, `prepare-fail`, and
+`dashboard`. There is no background process to stop.
 
 ## Doctor
 
@@ -50,6 +51,7 @@ The primary pipeline entry points are:
 APPLYPILOT_DIR="$APPLYPILOT_DIR" uv run applypilot run discover --query "<keywords>"
 APPLYPILOT_DIR="$APPLYPILOT_DIR" uv run applypilot run enrich
 APPLYPILOT_DIR="$APPLYPILOT_DIR" uv run applypilot score-pending
+APPLYPILOT_DIR="$APPLYPILOT_DIR" uv run applypilot prepare-queue
 APPLYPILOT_DIR="$APPLYPILOT_DIR" uv run applypilot dashboard
 ```
 
@@ -61,12 +63,14 @@ Store proof in `$EVIDENCE_DIR`. A passing CLI proof contains:
 - Separate stdout and stderr transcripts.
 - The Profile lane configuration used by the run.
 - Database counts before and after a state-changing command.
-- A read-only query showing the resulting rows or generated dashboard path.
+- A read-only query showing the resulting rows or generated artifact path.
 
 Exercise the CLI entry point. Unit-test helpers alone do not prove a feature.
 Dry-run proves request resolution only. Pair it with a real command and its
 database or file side effect. External HiringCafe HTTP remains live in the
-Discover recipe. Do not replace it with a mock for final proof.
+Discover recipe. Do not replace it with a mock for final proof. Prepare proof
+uses a disposable copy of Denny's Profile and invokes only the non-submitting
+`apply --gen --url` handoff.
 
 ## Cleanup
 

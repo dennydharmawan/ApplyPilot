@@ -69,8 +69,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
       - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
       - Scoring:    fit_score, score_reasoning, scored_at
-      - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
-      - Cover:      cover_letter_path, cover_letter_at, cover_attempts
+      - Prepare:    application_bundle_path, prepared_at
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
                    verification_confidence
@@ -110,15 +109,10 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             score_reasoning       TEXT,
             scored_at             TEXT,
 
-            -- Tailoring stage (resume tailor)
-            tailored_resume_path  TEXT,
-            tailored_at           TEXT,
-            tailor_attempts       INTEGER DEFAULT 0,
-
-            -- Cover letter stage
-            cover_letter_path     TEXT,
-            cover_letter_at       TEXT,
-            cover_attempts        INTEGER DEFAULT 0,
+            -- Preparation stage
+            application_bundle_path TEXT,
+            application_bundle_digest TEXT,
+            prepared_at           TEXT,
 
             -- Application stage
             applied_at            TEXT,
@@ -132,6 +126,45 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             verification_confidence TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS preparation_selections (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            status      TEXT NOT NULL CHECK (status IN ('active', 'completed', 'completed_with_failures')),
+            approved_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS one_active_preparation_selection
+        ON preparation_selections(status)
+        WHERE status = 'active'
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS preparation_selection_jobs (
+            selection_id INTEGER NOT NULL REFERENCES preparation_selections(id),
+            job_url      TEXT NOT NULL REFERENCES jobs(url),
+            position     INTEGER NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            failure_reason TEXT,
+            prepared_at  TEXT,
+            PRIMARY KEY (selection_id, job_url),
+            UNIQUE (selection_id, position)
+        )
+    """)
+    conn.commit()
+
+    selection_job_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(preparation_selection_jobs)")
+    }
+    if "status" not in selection_job_columns:
+        conn.execute(
+            "ALTER TABLE preparation_selection_jobs "
+            "ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+        )
+    if "failure_reason" not in selection_job_columns:
+        conn.execute(
+            "ALTER TABLE preparation_selection_jobs ADD COLUMN failure_reason TEXT"
+        )
     conn.commit()
 
     # Run migrations for any columns added after initial schema
@@ -162,14 +195,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
-    # Tailoring
-    "tailored_resume_path": "TEXT",
-    "tailored_at": "TEXT",
-    "tailor_attempts": "INTEGER DEFAULT 0",
-    # Cover letter
-    "cover_letter_path": "TEXT",
-    "cover_letter_at": "TEXT",
-    "cover_attempts": "INTEGER DEFAULT 0",
+    # Preparation
+    "application_bundle_path": "TEXT",
+    "application_bundle_digest": "TEXT",
+    "prepared_at": "TEXT",
     # Application
     "applied_at": "TEXT",
     "apply_status": "TEXT",
@@ -231,8 +260,8 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     Returns:
         Dictionary with keys:
             total, by_site, pending_detail, with_description,
-            scored, unscored, tailored, untailored_eligible,
-            with_cover_letter, applied, score_distribution
+            scored, unscored, preparation_eligible, prepared, applied,
+            score_distribution
     """
     if conn is None:
         conn = get_connection()
@@ -279,32 +308,15 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
 
-    # Tailoring stage
-    stats["tailored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL"
+    # Preparation stage
+    stats["prepared"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE application_bundle_path IS NOT NULL"
     ).fetchone()[0]
 
-    stats["untailored_eligible"] = conn.execute(
+    stats["preparation_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
-    ).fetchone()[0]
-
-    stats["tailor_exhausted"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE COALESCE(tailor_attempts, 0) >= 5 "
-        "AND tailored_resume_path IS NULL"
-    ).fetchone()[0]
-
-    # Cover letter stage
-    stats["with_cover_letter"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL"
-    ).fetchone()[0]
-
-    stats["cover_exhausted"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE COALESCE(cover_attempts, 0) >= 5 "
-        "AND (cover_letter_path IS NULL OR cover_letter_path = '')"
+        "WHERE fit_score >= 6 AND full_description IS NOT NULL "
+        "AND TRIM(full_description) != '' AND application_bundle_path IS NULL"
     ).fetchone()[0]
 
     # Application stage
@@ -318,7 +330,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE tailored_resume_path IS NOT NULL "
+        "WHERE application_bundle_path IS NOT NULL "
         "AND applied_at IS NULL "
         "AND application_url IS NOT NULL"
     ).fetchone()[0]
@@ -382,7 +394,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     Args:
         conn: Database connection. Uses get_connection() if None.
-        stage: One of "discovered", "enriched", "scored", "tailored", "applied".
+        stage: One of "discovered", "enriched", "scored", "prepared", "applied".
         min_score: Minimum fit_score filter (only relevant for scored+ stages).
         limit: Maximum number of rows to return.
 
@@ -398,13 +410,13 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "enriched": "full_description IS NOT NULL",
         "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
         "scored": "fit_score IS NOT NULL",
-        "pending_tailor": (
+        "preparation_queue": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            "AND application_bundle_path IS NULL"
         ),
-        "tailored": "tailored_resume_path IS NOT NULL",
+        "prepared": "application_bundle_path IS NOT NULL",
         "pending_apply": (
-            "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
+            "application_bundle_path IS NOT NULL AND applied_at IS NULL "
             "AND application_url IS NOT NULL"
         ),
         "applied": "applied_at IS NOT NULL",
@@ -416,9 +428,9 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if "?" in where and min_score is not None:
         params.append(min_score)
     elif "?" in where:
-        params.append(7)  # default min_score
+        params.append(6)  # default Preparation eligibility score
 
-    if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied"):
+    if min_score is not None and "fit_score" not in where and stage in ("scored", "prepared", "applied"):
         where += " AND fit_score >= ?"
         params.append(min_score)
 

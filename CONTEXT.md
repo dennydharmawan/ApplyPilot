@@ -48,6 +48,26 @@ _Avoid_: detail scrape (as the stage name), LLM enrich
 Pipeline stage 3. A fit rating 1–10 plus reasoning written onto a job in the Profile DB. Done by Cursor (parent chat and/or parallel subagents), persisted via a write helper — not Codex, Gemini, or any API LLM scorer. Inputs are resume, full JD, Profile preferences, and that Profile's standing notes. Done means every pending enriched job is scored and the HTML dashboard is opened.
 _Avoid_: run score, codex exec scoring, automated LLM score
 
+**Preparation queue**:
+Profile jobs with a fit score of 6 or higher that are eligible for application-material preparation. Eligibility does not select a job or start Prepare.
+_Avoid_: auto-tailor, score threshold as approval, automatic generation
+
+**Preparation selection**:
+The exact list of queued jobs Denny approves for Prepare. Approval covers autonomous material generation for that list, not application submission.
+_Avoid_: every 6+ job, score as approval, submission consent
+
+**Prepare**:
+The autonomous workflow that researches each job in the Preparation selection, maps its requirements to Profile evidence, and produces its Application Bundle without intermediate or final approval questions. Unsupported requirements remain documented gaps.
+_Avoid_: automatic Tailor stage, automatic Cover stage, API LLM pipeline
+
+**Application Bundle**:
+The Profile-scoped, per-job collection of application materials produced by Prepare. Its resume, cover letter when applicable, and evidence mapping remain separate artifacts for one job.
+_Avoid_: flat tailored-resumes folder, shared cover letter, generated files as submission consent
+
+**Cover letter trigger**:
+A job or application channel that makes a cover letter useful: the posting requests one, the application offers an upload field, or the application is sent by email. Prepare omits the cover letter when none applies.
+_Avoid_: cover letter for every job, generic letter, unused attachment
+
 **Standing notes**:
 The Profile-scoped counterpart to personal `/remember`: durable preference and policy notes for one person, not repo `AGENTS.md` and not global user-context rules. Freeform prose lives in `standing-notes.md` under that Profile's `APPLYPILOT_DIR`. Enumerable rules that engines or skills enforce live in `profile.json`. An update skill works like `/remember` (interview → append/edit the right target); stable rules may be promoted from markdown into JSON. Not chat memory.
 _Avoid_: preferences (when meaning freeform policy), scratchpad, AGENTS.md (for person policy), single junk-drawer profile.json notes blob

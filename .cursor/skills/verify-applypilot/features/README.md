@@ -1,6 +1,6 @@
 # ApplyPilot verification map
 
-This map covers the user-facing Discover, Enrich, and Score pipeline. Start
+This map covers the user-facing Discover, Enrich, Score, and Prepare pipeline. Start
 from the Doctor section in the parent skill and keep all proof under the active
 `$EVIDENCE_DIR`.
 
@@ -27,6 +27,8 @@ from the Doctor section in the parent skill and keep all proof under the active
 - Discover proof needs a live HiringCafe request and a database read afterward.
 - Enrich proof needs a description or explicit leftover state in the database.
 - Score proof needs persisted scores plus an opened `dashboard.html`.
+- Prepare proof needs an exact recorded selection, registered bundle files, and
+  unchanged application status in a disposable Denny Profile copy.
 - Record any unreachable external URL with the command and error transcript.
 
 ## Features
@@ -36,3 +38,5 @@ from the Doctor section in the parent skill and keep all proof under the active
 - [Enrich jobs](enrich.md) covers description and application URL enrichment.
 - [Score and dashboard](score-dashboard.md) covers pending jobs, persisted fit
   scores, and the HTML deliverable.
+- [Prepare bundles](prepare.md) covers the approval boundary, Profile isolation,
+  bundle validation, and the database handoff to Apply.

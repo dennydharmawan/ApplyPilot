@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -80,7 +79,7 @@ def _setup_resume() -> None:
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, Preparation, and auto-fill."))
 
     profile: dict = {}
 
@@ -147,9 +146,9 @@ def _setup_profile() -> dict:
         "tools": [s.strip() for s in tools.split(",") if s.strip()],
     }
 
-    # -- Resume Facts (preserved truths for tailoring) --
+    # -- Resume Facts (preserved truths for Preparation) --
     console.print("\n[bold cyan]Resume Facts[/bold cyan]")
-    console.print("[dim]These are preserved exactly during resume tailoring — the AI will never change them.[/dim]")
+    console.print("[dim]These remain locked during Preparation.[/dim]")
     companies = Prompt.ask("Companies to always keep (comma-separated)", default="")
     projects = Prompt.ask("Projects to always keep (comma-separated)", default="")
     school = Prompt.ask("School name(s) to preserve", default="")
@@ -237,14 +236,14 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Ask about optional agent model configuration."""
     console.print(Panel(
         "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
+        "An agent handles job scoring and Preparation through repository skills.\n"
         "Without this, you can still discover and enrich jobs."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
+    if not Confirm.ask("Configure an agent model?", default=True):
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
@@ -298,7 +297,7 @@ def _setup_auto_apply() -> None:
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
-        console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
+        console.print("[dim]You can apply manually using registered Application Bundles.[/dim]")
         return
 
     # Check for Claude Code CLI
